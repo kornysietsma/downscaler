@@ -99,18 +99,10 @@ fn downscale_recursive(root_source: &Path, root_dest: &Path, suffix: &Vec<OsStri
     Ok(())
 }
 
-fn validate_path_exists(path: &str) -> Result<(), String> {
-    if !Path::new(path).is_dir() {
-        Err(format!("Path {} does not exist", path))
-    } else {
-        Ok(())
-    }
-}
-
 #[derive(Debug, Parser)]
 #[clap(author, version, about)]
 struct Opts {
-    #[clap(value_parser, short, long, value_parser=validate_path_exists)]
+    #[clap(value_parser, short, long)]
     source: PathBuf,
     #[clap(value_parser, short, long)]
     destination: PathBuf,
@@ -122,6 +114,10 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let opts = Opts::try_parse()?;
+
+    if !Path::new(&opts.source).is_dir() {
+        return Err(anyhow!("Source path {:?} does not exist", &opts.source));
+    }
 
     downscale_recursive(&opts.source, &opts.destination, &Vec::new())
 }
