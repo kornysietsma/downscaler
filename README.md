@@ -1,7 +1,7 @@
 # Downscaler
 
 Uses [ffmpeg](https://ffmpeg.org/) to process a directory tree of videos and downscale them
-to 720p with a high compression ratio, e.g. for putting them on a kid's tablet.
+with high compression using libx265 (H.265/HEVC), e.g. for putting them on a kid's tablet.
 (this can compress them to less than 1/4 of the original size!)
 
 Assumes you have ffmpeg installed an in your path.  Ffmpeg is doing all the real work here!
@@ -11,6 +11,49 @@ I'm sharing this mostly s I think it's a nice example of using rust where once I
 It also makes a nice example rust program - if people are scared by all the "rust is complex" stuff - in many cases it really isn't.  This code doesn't care about threads or `async` or the borrow checker or anything - it's very simple procedural code.  All error handling is pretty transparent.
 
 (yes, for non-trivial rust development you will need to understand the borrow checker - but I'm just pointing out that for many specific areas of code, it won't be relevant)
+
+## Usage
+
+```sh
+downscaler --source <SOURCE> --destination <DESTINATION> [OPTIONS]
+```
+
+### Scaling Options
+
+By default, videos are re-encoded without scaling (preserving original resolution). You can specify scaling behavior:
+
+- `--scale <HEIGHT>`: Set default maximum height for all videos (e.g., `--scale 720` or `--scale 1080`)
+- `--override <DIR:HEIGHT>`: Override scale for specific directories (e.g., `--override movies:1080`)
+
+**Important notes:**
+- Overrides match from the source root as whole path components
+- `--override tv:720` matches `tv/kids/video.mp4` but NOT `movies/tv/video.mp4` or `tvfish/video.mp4`
+- Subdirectories work: `--override tv/kids:480` matches only files under `tv/kids/`
+- More specific overrides take precedence over less specific ones
+- Scaling only downscales, never upscales (uses ffmpeg's `min()` function)
+
+### Examples
+
+```sh
+# Re-encode without scaling (default)
+cargo run -- -s /videos/source -d /videos/dest
+
+# Downscale everything to 720p
+cargo run -- -s /videos/source -d /videos/dest --scale 720
+
+# No scaling by default, but 720p for tv shows and 1080p for movies
+cargo run -- -s /videos/source -d /videos/dest \
+  --override tv:720 \
+  --override movies:1080
+
+# 720p default, with specific overrides
+cargo run -- -s /videos/source -d /videos/dest \
+  --scale 720 \
+  --override movies:1080 \
+  --override movies/kids:480
+```
+
+In the last example, a file at `movies/kids/cartoon.mp4` gets 480p (most specific match wins).
 
 ## Error handling
 

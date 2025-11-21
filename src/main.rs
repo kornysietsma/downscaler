@@ -2,6 +2,7 @@
 #![warn(clippy::all)]
 #![warn(rust_2018_idioms)]
 
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -18,8 +19,64 @@ use log::debug;
 use log::info;
 use log::warn;
 
-fn downscale(input: OsString, output: OsString) -> Result<()> {
-    info!("downscaling {:?} to {:?}", input, output);
+/// Parse a scale height value
+fn parse_scale(s: &str) -> Result<u32, String> {
+    s.parse::<u32>()
+        .map_err(|_| format!("Invalid scale value '{}', expected number", s))
+}
+
+/// Parse an override string like "movies:1080"
+fn parse_override(s: &str) -> Result<(PathBuf, u32), String> {
+    let parts: Vec<&str> = s.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "Override must be in format DIR:HEIGHT, got '{}'",
+            s
+        ));
+    }
+    let path = PathBuf::from(parts[0]);
+    let height = parts[1]
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid height '{}' in override, expected number", parts[1]))?;
+    Ok((path, height))
+}
+
+/// Determine which scale to use for a file based on its path
+fn determine_scale(
+    file_suffix: &[OsString],
+    default_scale: Option<u32>,
+    overrides: &HashMap<PathBuf, u32>,
+) -> Option<u32> {
+    // Convert suffix to PathBuf for easier comparison
+    let mut file_path = PathBuf::new();
+    for component in file_suffix {
+        file_path.push(component);
+    }
+
+    // Find the most specific (longest) matching override
+    let mut best_match: Option<u32> = None;
+    let mut best_match_depth = 0;
+
+    for (override_path, &height) in overrides {
+        // Check if file path starts with this override path
+        if file_path.starts_with(override_path) {
+            let depth = override_path.components().count();
+            if best_match.is_none() || depth > best_match_depth {
+                best_match = Some(height);
+                best_match_depth = depth;
+            }
+        }
+    }
+
+    best_match.or(default_scale)
+}
+
+fn downscale(input: OsString, output: OsString, scale: Option<u32>) -> Result<()> {
+    let scale_msg = match scale {
+        Some(height) => format!("scaling to max {}p", height),
+        None => "re-encoding without scaling".to_string(),
+    };
+    info!("{} {:?} to {:?}", scale_msg, input, output);
 
     // Create temp file paths in local temp directory
     let temp_dir = env::temp_dir();
@@ -61,27 +118,32 @@ fn downscale(input: OsString, output: OsString) -> Result<()> {
 
     // Run ffmpeg on temp files
     let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-i")
-        .arg(&temp_input)
-        .args([
-            "-c:v",
-            "libx265",
-            "-crf",
-            "28",
-            "-preset",
-            "fast",
-            "-c:a",
-            "copy",
-            "-vf",
-            "scale=-2:'min(720,ih)'",
-            "-loglevel",
-            "warning",
-            "-nostats",
-            "-hide_banner",
-            "-x265-params",
-            "log-level=error",
-        ])
-        .arg(&temp_output);
+    cmd.arg("-i").arg(&temp_input).args([
+        "-c:v",
+        "libx265",
+        "-crf",
+        "28",
+        "-preset",
+        "fast",
+        "-c:a",
+        "copy",
+    ]);
+
+    // Add scaling filter if specified
+    if let Some(height) = scale {
+        cmd.args(["-vf", &format!("scale=-2:'min({},ih)'", height)]);
+    }
+
+    cmd.args([
+        "-loglevel",
+        "warning",
+        "-nostats",
+        "-hide_banner",
+        "-x265-params",
+        "log-level=error",
+    ])
+    .arg(&temp_output);
+
     // echo cmd to stderr
     warn!("{:?}", cmd);
 
@@ -116,7 +178,13 @@ fn downscale(input: OsString, output: OsString) -> Result<()> {
     Ok(())
 }
 
-fn downscale_recursive(root_source: &Path, root_dest: &Path, suffix: &Vec<OsString>) -> Result<()> {
+fn downscale_recursive(
+    root_source: &Path,
+    root_dest: &Path,
+    suffix: &Vec<OsString>,
+    default_scale: Option<u32>,
+    overrides: &HashMap<PathBuf, u32>,
+) -> Result<()> {
     let mut source = PathBuf::from(root_source);
     let mut dest = PathBuf::from(root_dest);
     for dir in suffix {
@@ -131,7 +199,7 @@ fn downscale_recursive(root_source: &Path, root_dest: &Path, suffix: &Vec<OsStri
         if file_type.is_dir() {
             let mut new_suffix: Vec<OsString> = suffix.clone();
             new_suffix.push(entry.file_name());
-            downscale_recursive(root_source, root_dest, &new_suffix)?;
+            downscale_recursive(root_source, root_dest, &new_suffix, default_scale, overrides)?;
         } else if file_type.is_file() {
             let source_file = entry.path();
             if let Some(ext) = source_file.extension() {
@@ -144,7 +212,13 @@ fn downscale_recursive(root_source: &Path, root_dest: &Path, suffix: &Vec<OsStri
                     if dest_file.exists() {
                         debug!("not overwriting {:?}", &dest_file);
                     } else {
-                        downscale(source_file.into_os_string(), dest_file.into_os_string())?;
+                        // Determine the scale to use for this file
+                        let scale = determine_scale(suffix, default_scale, overrides);
+                        downscale(
+                            source_file.into_os_string(),
+                            dest_file.into_os_string(),
+                            scale,
+                        )?;
                     }
                 } else {
                     debug!("ignoring file - wrong extension {:?}", &source_file);
@@ -165,8 +239,17 @@ fn downscale_recursive(root_source: &Path, root_dest: &Path, suffix: &Vec<OsStri
 struct Opts {
     #[clap(value_parser, short, long)]
     source: PathBuf,
+
     #[clap(value_parser, short, long)]
     destination: PathBuf,
+
+    /// Default scale height (omit for no scaling, just re-encode)
+    #[clap(long, value_parser = parse_scale, value_name = "HEIGHT")]
+    scale: Option<u32>,
+
+    /// Override scale for specific directories (e.g., --override movies:1080)
+    #[clap(long = "override", value_parser = parse_override, value_name = "DIR:HEIGHT")]
+    overrides: Vec<(PathBuf, u32)>,
 }
 
 fn main() -> Result<()> {
@@ -180,5 +263,19 @@ fn main() -> Result<()> {
         return Err(anyhow!("Source path {:?} does not exist", &opts.source));
     }
 
-    downscale_recursive(&opts.source, &opts.destination, &Vec::new())
+    // Convert overrides Vec into HashMap
+    let overrides: HashMap<PathBuf, u32> = opts.overrides.into_iter().collect();
+
+    info!("Default scale: {:?}", opts.scale);
+    if !overrides.is_empty() {
+        info!("Scale overrides: {:?}", overrides);
+    }
+
+    downscale_recursive(
+        &opts.source,
+        &opts.destination,
+        &Vec::new(),
+        opts.scale,
+        &overrides,
+    )
 }
